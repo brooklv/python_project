@@ -1,0 +1,24 @@
+(dp1
+S'Jack'
+p2
+(dp3
+S'category'
+p4
+S'colleague'
+p5
+sS'department'
+p6
+S'software develop'
+p7
+sS'age'
+p8
+S'34'
+p9
+sS'name'
+p10
+g2
+sS'sex'
+p11
+S'man'
+p12
+ss.
