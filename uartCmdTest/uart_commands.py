@@ -3,14 +3,18 @@
 跟 C 版的区别：那边每条指令是手写的十六进制字符串，命令码一改就会
 和字符串脱节；这里的 ``hex`` 是从 ``cmd`` + ``data`` **算出来的**，
 不可能不一致。空 ``data`` 自动构造成查询指令（data_len = FF FF）。
+
+``ask`` 标记"这条指令的 data 得现问用户"——SSID、密码这类没有合理默认值的
+东西，写死一个示例值只会让人以为能直接发。具体怎么问在 uart_stress_test.py
+的 ``ASK_HANDLERS`` 里，这个文件只放**名字**，保持纯数据不掺交互逻辑。
 """
 
 from dataclasses import dataclass, field
 
 from uart_protocol import (
-    Cmd, STA_CONNECT, STA_FORGET, STA_SCAN, STA_SCAN_RESULT,
+    Cmd, STA_CONNECT, STA_FORGET, STA_SCAN, STA_SCAN_RESULT, Tag,
     WIFI_CHN_2G4, WIFI_CHN_5G, WIFI_CHN_AUTO,
-    build, hex_str,
+    build, hex_str, tag_name,
 )
 
 
@@ -20,15 +24,24 @@ class CmdDef:
     name: str
     cmd: Cmd
     data: bytes = b""       # 留空 = 查询指令
-    danger: bool = False    # 有副作用（重启、恢复出厂）
+    danger: bool = False    # 有副作用（重启、恢复出厂、开 log）
+    tag: int = Tag.TG       # 非 TG 就是 Remote 指令，由对端执行
+    ask: str = ""           # 非空 = data 现场问用户，值是 handler 名字
 
     @property
     def hex(self) -> str:
-        return hex_str(build(self.cmd, self.data).pack())
+        """线上字节。``ask`` 类返回空串 —— 它的 data 还不存在。"""
+        if self.ask:
+            return ""
+        return hex_str(build(self.cmd, self.data, tag=self.tag).pack())
 
     @property
     def label(self) -> str:
-        return ("!! " if self.danger else "") + self.name
+        # Remote 指令要在名字上标出来 —— 发错对象（本地当对端）时
+        # 症状是超时，光看名字分不出来
+        mark = "!! " if self.danger else ""
+        via = "" if self.tag == Tag.TG else f" [{tag_name(self.tag)}]"
+        return mark + self.name + via
 
 
 def _b(*vals: int) -> bytes:
@@ -60,9 +73,9 @@ COMMANDS: list = [
     CmdDef("网络", "查询 网络状态",     Cmd.NET_STA_CTRL),
     CmdDef("网络", "忘记所有网络",      Cmd.NET_STA_CTRL, _b(STA_FORGET, 0xFF)),
     CmdDef("网络", "忘记网络 id=0",    Cmd.NET_STA_CTRL, _b(STA_FORGET, 0x00)),
-    CmdDef("网络", "连接WiFi(需改SSID/密码)", Cmd.NET_STA_CTRL,
-           _b(STA_CONNECT) +
-           b"SSID=L-5G\tauthen=WPA+SAE\tpsk=13456789\tscan_ssid=1"),
+    # SSID / 加密方式 / 密码现场问 —— 原来这里写死了一个示例网络的
+    # SSID 和密码，直接发只会连一个不存在的网络
+    CmdDef("网络", "连接WiFi", Cmd.NET_STA_CTRL, ask="wifi_connect"),
 
     # ------------------------------------------------------------ 模式频段
     CmdDef("模式频段", "点对点模式 P2P",    Cmd.NET_ROLE, _b(0x00)),
@@ -77,9 +90,13 @@ COMMANDS: list = [
 
     # ------------------------------------------------------------ 热点信息
     CmdDef("热点信息", "查询 热点 SSID",    Cmd.AP_SSID),
-    CmdDef("热点信息", "改 SSID 为 abcd",  Cmd.AP_SSID, b"abcd"),
+    # 改 SSID / 改密码都是改持久配置，值必须用户自己给：
+    # 原来写死 abcd / 12345678，一按就把设备热点改成示例值了
+    CmdDef("热点信息", "改 热点 SSID",      Cmd.AP_SSID,
+           danger=True, ask="ap_ssid"),
     CmdDef("热点信息", "查询 热点密码",     Cmd.AP_PWD),
-    CmdDef("热点信息", "改密码 12345678",  Cmd.AP_PWD, b"12345678"),
+    CmdDef("热点信息", "改 热点密码",       Cmd.AP_PWD,
+           danger=True, ask="ap_pwd"),
     CmdDef("热点信息", "查询 设备名称",     Cmd.DEV_NAME),
     CmdDef("热点信息", "查询 Mac 地址",     Cmd.WIFI_MAC_ADDR),
     CmdDef("热点信息", "查询 WiFi 状态",    Cmd.WIFI_STATUS),
@@ -117,9 +134,12 @@ COMMANDS: list = [
     CmdDef("版本升级", "远端Tx版本检查",    Cmd.FW_UPGRADE_CTRL, _b(0x01, 0x01, 0x01)),
 
     # ---------------------------------------------------------------- 日志
-    CmdDef("日志", "打开所有 log",   Cmd.SET_LOG_STATUS, _b(0x03)),
-    CmdDef("日志", "只开 actui log", Cmd.SET_LOG_STATUS, _b(0x01)),
-    CmdDef("日志", "只开内核 log",    Cmd.SET_LOG_STATUS, _b(0x02)),
+    # !! 打开 log 之后设备**不再回应任何 UART 命令**，而且没法靠再发命令
+    # 救回来（连"关闭 log"也发不进去）。它只在 debug 时用，所以开 log 的
+    # 三条全标 danger；关 log 是安全方向，不标。
+    CmdDef("日志", "打开所有 log",   Cmd.SET_LOG_STATUS, _b(0x03), danger=True),
+    CmdDef("日志", "只开 actui log", Cmd.SET_LOG_STATUS, _b(0x01), danger=True),
+    CmdDef("日志", "只开内核 log",    Cmd.SET_LOG_STATUS, _b(0x02), danger=True),
     CmdDef("日志", "关闭所有 log",    Cmd.SET_LOG_STATUS, _b(0x00)),
     CmdDef("日志", "查询 log 设置",   Cmd.SET_LOG_STATUS),
 
@@ -128,6 +148,16 @@ COMMANDS: list = [
     CmdDef("系统", "dmesg",         Cmd.SYSTEM_COMMAND, b"dmesg"),
     CmdDef("系统", "重启设备",       Cmd.SYSTEM_COMMAND, b"reboot", danger=True),
     CmdDef("系统", "恢复出厂设置",   Cmd.RESET_TO_DEFAULT, _b(0x00), danger=True),
+
+    # ------------------------------------------------------------ Remote
+    # TAG=PL：本地 AM 透过 WiFi 送给对端 AM 执行。**要先和对端配对上**，
+    # 没配对时就是超时。字节和 Remote_Rx.ptp / Remote_Tx.ptp 一致。
+    CmdDef("Remote", "查询 对端Mac地址", Cmd.WIFI_MAC_ADDR, tag=Tag.PL),
+    CmdDef("Remote", "查询 对端SSID",    Cmd.TX_SSID,       tag=Tag.PL),
+    CmdDef("Remote", "查询 对端旋转角度", Cmd.ROTATION,      tag=Tag.PL),
+    CmdDef("Remote", "查询 对端缩放比例", Cmd.SET_OVERSCAN,  tag=Tag.PL),
+    CmdDef("Remote", "对端旋转 90 度",   Cmd.ROTATION, _b(0x01), tag=Tag.PL),
+    CmdDef("Remote", "对端旋转 270 度",  Cmd.ROTATION, _b(0x03), tag=Tag.PL),
 ]
 
 

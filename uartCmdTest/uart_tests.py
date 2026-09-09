@@ -17,8 +17,14 @@
 
 .. warning::
    ``danger`` tag 的测试会改设备持久配置或重启设备（改 SSID/密码、
-   恢复出厂、重启、执行升级）。它们**不带任何其它 tag**，所以只有
-   显式 ``--tags danger`` 才会跑到。
+   恢复出厂、重启、执行升级）。
+
+   ``logmode`` tag 的测试会打开设备 log，**之后所有 UART 命令都会失效**，
+   整轮测试就地死掉，而且没法靠再发命令救回来。log 只在 debug 时手动用，
+   测试里对 log 只做查询。
+
+   这两类**都不带任何其它 tag**，所以只有显式 ``--tags danger`` /
+   ``--tags logmode`` 才会跑到。
 """
 
 import uart_ui as ui
@@ -28,7 +34,7 @@ from uart_exec import (
     set_and_restore, set_and_verify, simple,
 )
 from uart_protocol import (
-    Cmd, STA_FORGET, STA_SCAN, STA_SCAN_RESULT,
+    Cmd, STA_FORGET, STA_SCAN, STA_SCAN_RESULT, Tag,
     WIFI_CHN_2G4, WIFI_CHN_5G, WIFI_CHN_AUTO,
     build_connect, err_name, network_count, parse_scan_list, resp_id_of,
 )
@@ -203,15 +209,21 @@ TESTS = [
     # -------------------------------------------------- WiFi 老化主流程
     # 默认跑的就是这 5 条（DEFAULT_TAGS = core）
     # max_duration 卡时延退化，依据是实测延迟留 3 倍余量
+    #
+    # needs_sta: 这四条是"连路由"的流程，只有开热点的那一方才做 ——
+    # 一对一的 Tx / 一对多的 Rx 连的是对端热点，压根没有连路由这回事，
+    # 对它们跑这四条只会全部超时。
     Test("扫描网络",       t_scan,        tags=("core", "wifi"),
-         max_duration=MAX_SCAN),
+         needs_sta=True, max_duration=MAX_SCAN),
     Test("获取扫描结果",    t_scan_result, needs=("扫描网络",),
-         tags=("core", "wifi"), max_duration=MAX_SCAN_RES),
+         tags=("core", "wifi"), needs_sta=True, max_duration=MAX_SCAN_RES),
     # needs_creds: 只有这条真的要用 ssid/password
     Test("连接网络",       t_connect,     needs=("获取扫描结果",),
-         tags=("core", "wifi"), needs_creds=True, max_duration=MAX_CONNECT),
+         tags=("core", "wifi"), needs_creds=True, needs_sta=True,
+         max_duration=MAX_CONNECT),
     Test("忘记网络",       t_forget,      needs=("连接网络",),
-         tags=("core", "wifi"), max_duration=MAX_FORGET),
+         tags=("core", "wifi"), needs_sta=True, max_duration=MAX_FORGET),
+    # 切频段是本机自己的射频设置，两种角色都做得到，不卡 needs_sta
     Test("切换到5G",       t_switch_5g,   tags=("core", "wifi", "band"),
          max_duration=MAX_QUICK),
 
@@ -224,12 +236,17 @@ TESTS = [
     Test("查询 设备名称",   query_str(Cmd.DEV_NAME),          tags=("query",)),
     Test("查询 Rx版本",
          query_str(Cmd.FW_VERSION, pattern=RE_VERSION),  tags=("query",)),
+    # 问的是"配对上的那个 Tx 的版本"，所以要求本机是 Rx
     Test("查询 Tx版本",
-         query_str(Cmd.GET_TX_VERSION, pattern=RE_VERSION), tags=("query",)),
-    Test("查询 热点SSID",   query_str(Cmd.AP_SSID),           tags=("query", "ap")),
+         query_str(Cmd.GET_TX_VERSION, pattern=RE_VERSION),
+         tags=("query",), roles=("rx",)),
+    # 热点参数只有开热点的那一方才有意义
+    Test("查询 热点SSID",   query_str(Cmd.AP_SSID),
+         tags=("query", "ap"), needs_ap=True),
     # 热点密码按 WPA 规范至少 8 位
     Test("查询 热点密码",
-         query_str(Cmd.AP_PWD, min_len=8),               tags=("query", "ap")),
+         query_str(Cmd.AP_PWD, min_len=8),
+         tags=("query", "ap"), needs_ap=True),
     # allowed=True 直接复用 names 的键当合法集合，不用把枚举写两遍
     Test("查询 当前模式",
          query_int(Cmd.NET_ROLE, names=NET_ROLE_NAME, allowed=True),
@@ -342,20 +359,27 @@ TESTS = [
     Test("执行配对", simple(Cmd.PAIRING_CTRL, b"\x00\x01"), tags=("cast", "pair")),
 
     # -------------------------------------------------- log 控制
+    # !! 打开 log 会让**后续所有命令失效** —— 设备被 log 刷屏之后不再
+    # 回应 UART 命令，整轮测试就地死掉，而且没法靠再发命令救回来。
+    # log 只在 debug 时手动用。
+    #
+    # 所以这几条只挂 logmode 一个 tag，**故意不挂 log / query** ——
+    # 只有显式 --tags logmode 才跑得到。测试里对 log 只做查询。
     Test("log 全开",
          set_and_verify(Cmd.SET_LOG_STATUS, b"\x03", 3, names=LOG_STATUS),
-         tags=("log",)),
+         tags=("logmode",)),
     Test("log 仅actui",
          set_and_verify(Cmd.SET_LOG_STATUS, b"\x01", 1, names=LOG_STATUS),
-         tags=("log",)),
+         tags=("logmode",)),
     Test("log 仅内核",
          set_and_verify(Cmd.SET_LOG_STATUS, b"\x02", 2, names=LOG_STATUS),
-         tags=("log",)),
+         tags=("logmode",)),
+    # 全关是唯一"安全方向"的设置 —— 它把命令通道从 log 里救出来
     Test("log 全关",
          set_and_restore(Cmd.SET_LOG_STATUS, b"\x00", 0, names=LOG_STATUS),
-         tags=("log",)),
-    Test("临时开log",    simple(Cmd.NULL_CONSOLE, b"\x00"),   tags=("log",)),
-    Test("临时关log",    simple(Cmd.NULL_CONSOLE, b"\x01"),   tags=("log",)),
+         tags=("logmode",)),
+    Test("临时开log",    simple(Cmd.NULL_CONSOLE, b"\x00"), tags=("logmode",)),
+    Test("临时关log",    simple(Cmd.NULL_CONSOLE, b"\x01"), tags=("logmode",)),
 
     # -------------------------------------------------- OTA（只做版本检测）
     # 真正执行升级的在 danger 组里
@@ -376,18 +400,51 @@ TESTS = [
          simple(Cmd.ENCODE_PARAM, b"\x02\x00\x12\x7A\x00"), tags=("encode",)),
 
     # -------------------------------------------------- Tx 端专用（文档第 2 章）
-    Test("Tx 查询SSID",  query_str(Cmd.TX_SSID),        tags=("tx", "query")),
-    Test("Tx 查询HDMI",  query_hex(Cmd.TX_HDMI_STATUS), tags=("tx", "query")),
+    # roles=("tx",)：这两条问的是本机自己的 Tx 状态，只有本机是 Tx 才有意义。
+    # 要问对端 Tx 的同样信息，走下面 Remote 那组。
+    Test("Tx 查询SSID",  query_str(Cmd.TX_SSID),
+         tags=("tx", "query"), roles=("tx",)),
+    Test("Tx 查询HDMI",  query_hex(Cmd.TX_HDMI_STATUS),
+         tags=("tx", "query"), roles=("tx",)),
 
     # -------------------------------------------------- 系统信息
     Test("dmesg", simple(Cmd.SYSTEM_COMMAND, b"dmesg"), tags=("sys",)),
 
+    # -------------------------------------------------- Remote（对端执行）
+    # TAG=PL：本地 AM 透过 WiFi 把命令送给对端 AM 执行，应答带同一个 TAG
+    # 送回来。**前提是已经和对端配对上**，没配对时会超时 —— 所以不在
+    # 默认集合里，要显式 --tags remote。
+    #
+    # 这几条抄自 Remote_Rx.ptp / Remote_Tx.ptp（doclight 实测用例），
+    # 全是只读查询：改对端的持久配置得靠本地那套 danger 测试，不从这里做。
+    #
+    # 只挂 remote 一个 tag，**故意不挂 query / display** —— 否则
+    # --tags query（号称"最安全"）会把它们拉进来，没配对时超时报成假失败。
+    # 和 danger 一样：需要前置条件的测试只能显式点名。
+    Test("Remote 查询对端Mac",
+         query_str(Cmd.WIFI_MAC_ADDR, pattern=RE_MAC, tag=Tag.PL),
+         tags=("remote",)),
+    Test("Remote 查询对端SSID",
+         query_str(Cmd.TX_SSID, tag=Tag.PL),
+         tags=("remote",)),
+    Test("Remote 查询对端旋转角度",
+         query_int(Cmd.ROTATION, names=ROTATION_ANGLE, allowed=True,
+                   tag=Tag.PL),
+         tags=("remote",)),
+    Test("Remote 查询对端缩放比例",
+         query_int(Cmd.SET_OVERSCAN, size=2, unit="%",
+                   lo=ZOOM_LO, hi=ZOOM_HI, tag=Tag.PL),
+         tags=("remote",)),
+
     # ================================================== 有副作用的
     # 这些不带任何其它 tag，只有显式 --tags danger 才会跑到
+    # 改的是本机热点，只有开热点的那一方才有热点可改
     Test("改SSID为abcd",
-         simple(Cmd.AP_SSID, b"abcd"),                 tags=("danger",)),
+         simple(Cmd.AP_SSID, b"abcd"),                 tags=("danger",),
+         needs_ap=True),
     Test("改密码为12345678",
-         simple(Cmd.AP_PWD, b"12345678"),              tags=("danger",)),
+         simple(Cmd.AP_PWD, b"12345678"),              tags=("danger",),
+         needs_ap=True),
     Test("执行本地升级",
          simple(Cmd.FW_UPGRADE_CTRL, b"\x02\x00\x01"), tags=("danger",)),
     Test("恢复出厂设置",
@@ -399,23 +456,31 @@ TESTS = [
 # 不给 --tags 时跑哪些。core = WiFi 老化那 5 条。
 DEFAULT_TAGS = ["core"]
 
-# 带这些 tag 的测试会改设备持久配置或重启，列出来供 --list-tests 提示
-DANGER_TAGS = ["danger"]
+# 必须显式点名才会跑的 tag，--list-tests 里标 !!：
+#   danger  —— 改设备持久配置或重启
+#   logmode —— 打开 log 后设备不再回应任何命令，整轮测试就地死掉
+DANGER_TAGS = ["danger", "logmode"]
 
 
 # 全部跑完后恢复到这些已知值。
 # 覆盖的是**没有查询指令、set_and_restore 读不回来**的状态 ——
 # 否则跑完 --tags net 设备可能停在日本区、2.4G、P2P 模式上。
+#
+# data 一律写成 bytes([...])：这张表全是不可打印的控制字节，用转义写会被
+# 各种编辑/生成环节悄悄变成裸字节（这里真发生过 —— 一度写成了裸 0x03，
+# 在编辑器里完全看不见），用数字列表就没有这个歧义。
 BASELINE = [
-    ("区域码 中国CN",  Cmd.NET_AP_PARAM,   b""),
+    ("区域码 中国CN",  Cmd.NET_AP_PARAM,    bytes([0x06, 0x03])),
     ("频段 5G",        Cmd.SWITCH_WIFI_CHN, bytes([WIFI_CHN_5G])),
-    ("三合一模式",     Cmd.NET_ROLE,       b""),
-    ("HDMI 开",        Cmd.HDMI_ENABLE,    b""),
-    ("旋转 0度",       Cmd.ROTATION,       b"\x00"),
-    ("缩放 100%",      Cmd.SET_OVERSCAN,   b"d"),
-    ("静音 关",        Cmd.AUDIO_MUTE,     b"\x00"),
-    ("log 全开",       Cmd.SET_LOG_STATUS, b""),
-    ("断开投屏",       Cmd.SCREEN_CAST,    b"\x00"),
+    ("三合一模式",     Cmd.NET_ROLE,        bytes([0x01])),
+    ("HDMI 开",        Cmd.HDMI_ENABLE,     bytes([0x01])),
+    ("旋转 0度",       Cmd.ROTATION,        bytes([0x00])),
+    ("缩放 100%",      Cmd.SET_OVERSCAN,    bytes([100])),
+    ("静音 关",        Cmd.AUDIO_MUTE,      bytes([0x00])),
+    # log 刻意不进基线。原来这里恢复成"全开"(0x03)，等于每轮收尾都把命令
+    # 通道弄死 —— 打开 log 之后设备不再回应任何 UART 命令。恢复成全关又会
+    # 盖掉用户自己设的 debug 状态，所以 log 状态归用户管，测试不碰。
+    ("断开投屏",       Cmd.SCREEN_CAST,     bytes([0x00])),
 ]
 
 

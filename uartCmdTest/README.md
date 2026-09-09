@@ -39,15 +39,18 @@ sudo usermod -a -G dialout $(whoami)     # 加组后需重新登录
 python3 uart_stress_test.py --list-tests
 
 # 2. 只跑只读查询，验证串口通了。最安全，不需要 -s/-w
+#    不给 --role/--topology 会先提示选被测设备的角色
 python3 uart_stress_test.py -p /dev/ttyUSB0 --tags query -c 1
 
-# 3. WiFi 老化循环（默认组）
-python3 uart_stress_test.py -p /dev/ttyUSB0 -s "Actmicro-wifi" -w "actionsuser"
+# 3. WiFi 老化循环（默认组）。Rx + 一对一 = Rx 开热点、同时连路由
+python3 uart_stress_test.py -p /dev/ttyUSB0 --role rx --topology 1to1 \
+    -s "Actmicro-wifi" -w "actionsuser"
 
-# 4. 长跑统计偶发失败率
-python3 uart_stress_test.py -p /dev/ttyUSB0 -s "Actmicro-wifi" -w "actionsuser" -c 500 -r 3
+# 4. 长跑统计偶发失败率。Tx + 一对多 = Tx 开 softap、同时连路由
+python3 uart_stress_test.py -p /dev/ttyUSB0 --role tx --topology 1tomany \
+    -s "Actmicro-wifi" -w "actionsuser" -c 500 -r 3
 
-# 5. 手发十六进制调协议
+# 5. 手发十六进制调协议（指令模式不需要角色）
 python3 uart_stress_test.py -p /dev/ttyUSB0 -i
 ```
 
@@ -62,10 +65,15 @@ python3 uart_stress_test.py -p /dev/ttyUSB0 -i
 --tags display            # 旋转/缩放/HDMI/HDCP
 --tags audio,net          # 多个 tag 取并集
 --tags core -c 500 -r 3   # WiFi 老化长跑
+--tags remote             # Remote 指令，需先和对端配对
 --tags danger             # !! 会改配置或重启设备
+--tags logmode            # !! 开 log 后设备不再回应任何命令
 ```
 
 被选中的测试如果依赖了别的测试，依赖会自动带上，不用手动列。
+
+`--tags` 选完之后还会再按**角色**筛一遍：不适用于当前 `--role`/`--topology`
+的测试直接不跑，见[被测设备的角色](#被测设备的角色)。
 
 ### 什么时候需要 `-s` / `-w`
 
@@ -79,6 +87,9 @@ python3 uart_stress_test.py -p /dev/ttyUSB0 -i
 
 判断依据是测试的 `needs_creds` 标记，不是 tag —— 「查询 WiFi状态」归类上属于
 `wifi`，但它是只读查询，不需要任何凭据。
+
+**角色也会影响这个判断**：一台不连路由的设备（一对一的 Tx、一对多的 Rx）
+压根不跑「连接网络」，`--tags core` 也不会要求 `-s`/`-w`。
 
 ### 循环与重试
 
@@ -127,10 +138,13 @@ python3 uart_stress_test.py -p /dev/ttyUSB0 --tags query -c 1 || echo "查询测
 | `uart_serial.py` | 串口整包收发、超时、缓冲清理 |
 | `uart_report.py` | 跨轮次累计，输出 JSON / JUnit |
 | `uart_commands.py` | 指令模式的指令表 |
+| `uart_role.py` | 被测设备角色：Tx/Rx × 拓扑 → 谁开热点、谁连路由 |
 | `uart_ui.py` | 日志、配色、hexdump、状态栏、交互确认 |
 | `uart_stress_test.py` | CLI、外层循环（cycles / retry） |
 | `test_protocol.py` | 协议层回归测试 |
 | `test_exec.py` | 执行机制回归测试 |
+| `test_role.py` | 角色模型和角色筛选的回归测试 |
+| `test_commands.py` | 指令表回归测试（`!!` 标记、交互参数） |
 | `test_report.py` | 报告输出回归测试 |
 
 ## 工具自身的回归测试
@@ -149,8 +163,13 @@ python3 -m unittest discover -v      # 约 0.2 秒
 - 配对状态的值在 rc 之后偏移 1，中间夹了填充字节
 - 返回码必须检查 —— 只看包格式会把 `FAILED` / `INCORRECT_PWD` 当成成功
 - Command ID 是枚举值的小端序，应答 ID = 请求 `& 0x3FFF | 0x4000`
+- 校验和要截断到 16 位，且损坏的包必须被 `Ctx.recv()` 拦下
+- 一对一 Rx 开热点、一对多 Tx 开热点，且开热点的一方同时连路由
+- 角色排除测试时依赖链要跟着断，且凭据检查要在角色筛选之后
 
 把这三个历史 bug 注回代码验证过，分别有 4 / 10 / 3 个用例失败。
+角色和安全相关的守卫也逐条注错验证过（把 `is_ap` 的拓扑判断写反 → 5 条
+失败；漏标 `needs_sta` → 2 条；凭据检查忽略角色 → 1 条）。
 
 ---
 
@@ -353,6 +372,84 @@ TESTS = [
 
 ---
 
+## 被测设备的角色
+
+`--role` / `--topology` 决定被测设备在配对里扮演什么，进而决定 **WiFi
+相关测试怎么跑**。不给这两个参数，运行时会带说明提示选择。
+
+**配对关系决定谁开热点：**
+
+| 组合 | 开热点 | 连路由 | 说明 |
+|---|---|---|---|
+| `--role rx --topology 1to1` | 是 | 是 | Tx 连它；它连路由，给自己和 Tx 提供上网/OTA |
+| `--role tx --topology 1tomany` | 是 | 是 | 多个 Rx 连它；它连路由，给自己和这些 Rx 提供上网/OTA |
+| `--role tx --topology 1to1` | 否 | 否 | 只连 Rx 的热点 |
+| `--role rx --topology 1tomany` | 否 | 否 | 只连 Tx 的热点 |
+
+关键规则：**开热点的那一方同时也是 station**，负责连路由，给自己和连上
+自己的对端提供上网和 OTA。所以「是不是 AP」和「要不要连路由」是同一个判断
+（代码里是 `Setup.is_ap` / `Setup.is_sta`）。
+
+注意**拓扑会翻转角色的身份**：同一台 Tx，一对一时是客户端、一对多时是
+热点。所以只问 Tx/Rx 不够，必须连拓扑一起问。
+
+### 为什么必须区分
+
+扫描路由、连接路由、忘记网络这套**只有连路由的那一方做得到**。对一台
+一对一的 Tx 跑这四条，结果是全部超时 —— 而超时看起来像设备坏了，
+不像参数给错了。
+
+所以这类测试标了前提，不满足时**直接不跑，也不进报告**：
+
+```
+按角色（Tx 发送端 / 一对一）排除 4 条:
+  - 扫描网络（需要本机连路由）
+  - 获取扫描结果（依赖的测试已被角色排除）
+  - 连接网络（依赖的测试已被角色排除）
+  - 忘记网络（依赖的测试已被角色排除）
+本次要跑 1 条测试: 切换到5G
+```
+
+**排除而不是跳过**：「这台设备本来就不做这件事」不是缺陷，跳过会让人
+以为漏测了。依赖也跟着断 —— 否则下游测试会因为「依赖未通过」被判成
+跳过，看起来像出了问题。
+
+三种前提（写在 `uart_tests.py` 的 `Test(...)` 里）：
+
+| 字段 | 含义 | 用在 |
+|---|---|---|
+| `needs_sta=True` | 需要本机连路由 | 扫描 / 获取结果 / 连接 / 忘记网络 |
+| `needs_ap=True` | 需要本机开热点 | 查询和修改热点 SSID / 密码 |
+| `roles=("tx",)` | 只在指定角色下有意义 | Tx 专用查询；「查询 Tx版本」限 `rx` |
+
+切频段（`切换到5G`）**故意不卡** —— 那是本机自己的射频设置，两种角色
+都做得到。
+
+各角色能跑多少条见 `--list-tests`，它会实时统计而不是写死数字。
+
+### `-s` / `-w` 也跟着角色
+
+凭据检查在**角色筛选之后**才做。一台不连路由的设备压根不跑「连接网络」，
+就不会被要求给 `-s`/`-w`：
+
+```bash
+# 要求 -s/-w：Rx 会连路由
+--role rx --topology 1to1 --tags core   →  ✗ 这些测试需要 -s 和 -w: 连接网络
+
+# 不要求：Tx 一对一不连路由，那几条被排除了
+--role tx --topology 1to1 --tags core   →  正常启动
+```
+
+这是之前踩过的坑的同一类问题（用 tag 推断凭据需求，导致 `--tags query`
+也被索要 `-s`/`-w`），所以有专门的回归测试盯着。
+
+### CI / 非交互
+
+管道或重定向里读不到输入时不会挂住，直接报错并列出四种组合。测试函数
+要按角色分叉时读 `ctx.setup`；报告的 `meta` 里也记了 `role` / `topology`。
+
+---
+
 ## 依赖与筛选
 
 ### `needs` — 依赖
@@ -399,7 +496,8 @@ Test("连接网络", t_connect, needs=("获取扫描结果",), tags=("wifi","cor
 | `display` | 旋转 / 缩放 / HDMI / HDCP / 分辨率 |
 | `net` | 模式切换 / 频段 / 区域码 |
 | `wifi` | WiFi 相关 |
-| `log` | log 开关 |
+| `log` | log 状态**查询**（设置在 `logmode`） |
+| `remote` | Remote 指令，对端 AM 执行。**需先配对**，否则全超时 |
 | `cast` | 投屏 / 配对 |
 | `audio` | 静音 / 音量 |
 | `encode` | 编码参数 |
@@ -407,6 +505,7 @@ Test("连接网络", t_connect, needs=("获取扫描结果",), tags=("wifi","cor
 | `tx` | Tx 端专用命令 |
 | `sys` | 系统命令 |
 | `danger` | **!! 改配置或重启设备** |
+| `logmode` | **!! 打开 log 后设备不再回应任何命令** |
 | `rotate` `zoom` `hdmi` `hdcp` `role` `region` `band` `pair` `ap` | 更细的子类 |
 
 想只跑安全的：
@@ -416,8 +515,16 @@ python3 uart_stress_test.py -p /dev/ttyUSB0 --tags query -c 1
 ```
 
 > **`danger` 组会改设备持久配置或重启**（改 SSID/密码、执行升级、
-> 恢复出厂、重启）。它们**不带任何其它 tag**，所以只有显式
-> `--tags danger` 才会跑到，不会被 `--tags display` 之类误触。
+> 恢复出厂、重启）。
+>
+> **`logmode` 组会打开设备 log，之后所有 UART 命令都会失效** —— 设备被
+> log 刷屏后不再回应，整轮测试就地死掉，而且没法靠再发命令救回来（连
+> "关闭 log"也发不进去）。log 只在 debug 时手动用，**测试里对 log 只做查询**。
+>
+> 这两组**都不带任何其它 tag**，所以只有显式 `--tags danger` /
+> `--tags logmode` 才会跑到，不会被 `--tags display` 之类误触。
+> 同理 `logmode` 也**没有进基线恢复** —— 原来基线里有一条"恢复成 log 全开"，
+> 那等于每轮收尾都把命令通道弄死。
 
 ---
 
@@ -518,7 +625,10 @@ OTA 版本），当成应答收下会让整条流**永久错位** —— 之后�
 | `-t, --timeout 秒` | 30 | 等应答第一个字节的超时。设备慢时放宽 |
 | `-r, --retry N` | 0 | 单轮失败后最多重试几次。重试前自动清缓冲 + 忘记网络 |
 | `-l, --log 文件` | test.log | 日志文件 |
+| `--role tx\|rx` | 提示 | 被测设备是发送端还是接收端 |
+| `--topology 1to1\|1tomany` | 提示 | 配对拓扑。决定谁开热点 |
 | `--tags a,b` | `core` | 只跑带这些 tag 的测试，逗号分隔取并集，依赖自动带上 |
+| `--tx-checksum` | 关 | 发送时填真校验和（接收端忽略，仅用于验设备的校验逻辑） |
 | `--no-restore` | 关 | 跑完不恢复基线状态 |
 | `--report-json 文件` | — | 输出 JSON 报告 |
 | `--report-junit 文件` | — | 输出 JUnit XML，CI 可直接展示 |
@@ -576,7 +686,11 @@ python3 uart_stress_test.py -p /dev/ttyUSB0 -s W -w P -c 500 -r 3 \
   ✗ 连接网络: 2/500 轮失败
 耗时明显变长的测试:
   ⚠ 连接网络: 前半段 4.9s → 后半段 9.8s（慢了 2.0 倍）
+✗ 校验和错误: 3 次（线路质量问题）
 ```
+
+校验和错误单独报，因为它指向的原因不同 —— 不是固件的逻辑 bug，而是接线、
+干扰或波特率。只在真的发生过时才打这一行。
 
 ---
 
@@ -637,8 +751,45 @@ cmd> 14
 十六进制输入很宽松：空格、逗号、冒号、连字符都可省略，大小写均可，
 支持 `0x` 前缀，位数必须成对。
 
+### 需要参数的指令
+
+列表里标 `<按提示输入>` 的指令没有固定字节 —— SSID、密码这类东西没有
+合理的默认值，所以先问再拼：
+
+```
+cmd> 19
+
+  [网络] 连接WiFi
+    WiFi 名称 (SSID): Actmicro-wifi
+    加密方式:
+      1) WPA+SAE   WPA2/WPA3 兼容，实测可用（推荐）
+      2) WPA-PSK   仅 WPA2
+    选择 [1-2, 默认 1]:
+    WiFi 密码: actionsuser
+  可修改，Enter 发送，Ctrl+C 取消
+  hex> 47 54 00 00 23 82 3E 00 02 53 53 49 44 3D ...
+```
+
+问完仍然落到同一个 `hex>` 编辑行，所以**发之前还能看能改**。
+
+目前有三条：`连接WiFi`、`改 热点 SSID`、`改 热点密码`。加密方式默认
+`WPA+SAE`（WPA2/WPA3 兼容），这是实测设备接受的写法 —— 即使扫描结果
+报的是 `WPA-PSK` 也用它。密码按 WPA 规范卡 8~63 位，SSID 卡 1~32 位，
+只收 ASCII（data 是按字节发的，非 ASCII 会让字节数和字符数不一致）。
+
+> 之前这三条在表里写死了示例值（`SSID=L-5G` / `psk=13456789` / `abcd` /
+> `12345678`），选中直接就发出去了 —— 结果是连一个不存在的网络，或者
+> 把设备热点改成示例值。
+
 指令表在 `uart_commands.py`。那里的十六进制是从命令定义**算出来的**而不是
-手写字符串，所以不会和命令码脱节。
+手写字符串，所以不会和命令码脱节；要问参数的只在表里写一个 handler **名字**，
+怎么问放在 `uart_stress_test.py` 的 `ASK_HANDLERS`，表本身保持纯数据。
+
+### `!!` 标记
+
+列表里 `!!` 开头的会改持久配置或让设备失联，包括**开 log 的三条** ——
+打开 log 之后设备不再回应任何 UART 命令，连"关闭 log"都发不进去。
+`[PL]` 后缀是 Remote 指令，由**对端**执行，没配对时就是超时。
 
 ---
 
@@ -708,7 +859,8 @@ Header(2) │ Checksum(2) │ Command ID(2) │ Data Length(2) │ Data(变长)
   47 54   │    00 00    │     23 82     │     01 00      │     00
 ```
 
-- **Checksum** 发送端固定填 `00 00`，接收端忽略
+- **Checksum** 发送端默认填 `00 00`（接收端忽略），收到的包**一定校验**，
+  详见下一节
 - **Command ID** 是固件 `uartCmdID` 枚举值的**小端序**：
   `NET_STA_CTRL = 0x8223` → 线上 `23 82`
 - **应答 ID** = 请求 `& 0x3FFF | 0x4000`：`0x8223` → `0x4223`（线上 `23 42`）。
@@ -717,6 +869,84 @@ Header(2) │ Checksum(2) │ Command ID(2) │ Data Length(2) │ Data(变长)
   "无数据"，不是 65535
 
 这三点由 `struct.Struct("<2sHHh")` 一行表达，不用手工位运算。
+
+### TAG —— 这条命令由谁执行
+
+TAG 不是固定包头，它决定命令走到哪里为止。数值取自 spec 的 `TAG` 表，
+**按小端写到线上**。两字母码**按线上字节序读**就是 `(发起者, 执行者)`，
+`P` = MCU、`L` = AM：
+
+| 码 | 数值 | 线上 | 含义 |
+|----|------|------|------|
+| `TG` | `0x5447` | `47 54` | 本地 MCU → **本地 AM**，就地执行 |
+| `PL` | `0x4C50` | `50 4C` | 本地 MCU → **对端 AM**，本地 AM 透过 WiFi 转发 |
+| `PP` | `0x5050` | `50 50` | 本地 MCU → **对端 MCU**，对端 AM 再下发它的 UART |
+| `LP` | `0x504C` | `4C 50` | 对端 AM → 本地 MCU（对端主动发起） |
+| `LL` | `0x4C4C` | `4C 4C` | 对端 AM → 本地 AM |
+| — | `0xAC57` | `57 AC` | MCU 透传协议，**包结构完全不同**，见下 |
+
+我们（树莓派）扮演 MCU，所以**能发的只有 `TG` / `PL` / `PP`**。`LP` 是
+对端 AM 主动发给我们的请求，只解析不构造。
+
+> spec 把 `0x5447` 标成 `TG`（大端读法），和其它四条的线上读法相反。
+> **以数值为准，别照字母推字节。**
+
+```python
+build(Cmd.ROTATION)                    # 47 54 ... 本地
+build(Cmd.ROTATION, tag=Tag.PL)        # 50 4C ... 对端 AM
+build_remote(Cmd.ROTATION)             # 同上，语义更直白
+build_remote(Cmd.ROTATION, to_mcu=True)  # 50 50 ... 对端 MCU
+ctx.remote_step(Cmd.ROTATION)          # 测试里用这个
+```
+
+字节和 `Remote_Rx.ptp` / `Remote_Tx.ptp`（doclight 实测用例）逐字节一致，
+这两个文件是最硬的参照 —— 它们是真的发出去过的字节，比 spec 表格更可信。
+
+**应答按 `(Command ID, TAG)` 两者匹配**，不是只比 ID。1 对多时对端们的
+应答会和本地应答挤在同一条串口上，只比 ID 就会把对端的应答当成本地的 ——
+之后每一步都在读上一条的应答。跳过包的日志一定带 TAG：
+
+```
+  (跳过异步通知: cmd=0x4823[PL] len=3)
+```
+
+认不出的 TAG 直接报错而不是硬解 —— 那说明流已经错位，或者对上了一个
+透传帧（它没有 8 字节包头，按命令包解会读出垃圾长度）。
+
+### 校验和
+
+规则（spec 3.2）：**除 checksum 字段本身外，所有字节相加，截断到 16 位**。
+
+```python
+def checksum_of(raw):
+    return (sum(raw[0:2]) + sum(raw[4:])) & 0xFFFF
+```
+
+截断不是可选的 —— 用 `test1.log` 里 382 个真实应答包验证，382/382 吻合，
+其中最大和为 `0xFBB8`（扫描列表全是 ASCII 才勉强没溢出，高字节多的包一定会）。
+
+**接收方向恒定校验**。`Ctx.recv()` 先打原始十六进制（损坏的包也要留证据），
+再比对校验和，不一致就计数 + 报错并丢弃：
+
+```
+[RX] 47 54 21 01 23 42 07 00 00 00 00 1B 00 00 00
+✗ 校验和错误: 字段 0x0121 ≠ 重算 0x0122（线路有字节损坏）
+```
+
+这一层必须有。上面那个例子只翻了一个数据位，网络个数就从 26 变成 27 ——
+不校验的话工具会拿着错数据往下跑，症状伪装成"设备返回了奇怪的值"，极难查。
+每轮结束的摘要会报累计的校验和错误数。
+
+**发送方向默认不填**（`00 00`），因为接收端忽略校验和，而 `00 00` 的格式
+实测连续 54 个循环通过 —— 没必要拿已验证的通路去换零收益。要填就加
+`--tx-checksum`，用来验证设备端的校验逻辑本身：
+
+```bash
+# 默认
+47 54 00 00 23 82 01 00 00
+# --tx-checksum
+47 54 41 01 23 82 01 00 00
+```
 
 ### 返回码
 

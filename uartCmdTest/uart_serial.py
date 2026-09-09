@@ -22,10 +22,14 @@ class UartClient:
     """串口客户端。固定 8 数据位 / 1 停止位 / 无奇偶校验 / 无流控。"""
 
     def __init__(self, port: str, baud: int = 115200, timeout: float = 30.0,
-                 log: Optional[Callable[[str], None]] = None):
+                 log: Optional[Callable[[str], None]] = None,
+                 tx_checksum: bool = False):
         self.port = port
         self.baud = baud
         self.timeout = timeout          # 等第一个字节的超时
+        # 发送时填真校验和。默认关：接收端忽略校验和，而 00 00 的格式
+        # 实测连续 54 个循环通过，没必要拿已验证的通路去换零收益。
+        self.tx_checksum = tx_checksum
         self._log = log or (lambda _m: None)
         self._ser: Optional[serial.Serial] = None
 
@@ -68,7 +72,7 @@ class UartClient:
 
     def send(self, pkt: Packet) -> bytes:
         """发送一个包，返回实际写出去的字节（供调用方打 TX 日志）。"""
-        raw = pkt.pack()
+        raw = pkt.pack(with_checksum=self.tx_checksum)
         self._ser.write(raw)
         self._ser.flush()               # 等硬件发完
         return raw

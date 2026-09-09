@@ -25,10 +25,15 @@ import uart_tests
 import uart_ui as ui
 from uart_exec import (
     MAX_LIST_PKTS, NOTIFY_TIMEOUT,
-    Aborted, Ctx, Result, filter_tests, restore_baseline, run_suite,
+    Aborted, Ctx, Result, filter_by_setup, filter_tests, restore_baseline,
+    run_suite,
 )
 from uart_report import Report
-from uart_protocol import parse_hex
+from uart_protocol import build, build_connect, hex_str, parse_hex
+from uart_role import (
+    ALL_SETUPS, Role, Setup, Topology,
+    guidance as role_guidance, menu_lines as role_menu_lines, parse_setup,
+)
 from uart_serial import UartClient
 
 try:
@@ -61,11 +66,19 @@ def _failed_names(records: dict) -> list:
     return [r.name for r in records.values() if r.result is Result.FAIL]
 
 
-def run_stress(client: UartClient, args) -> int:
-    tests = filter_tests(uart_tests.TESTS, args.tags or uart_tests.DEFAULT_TAGS)
+def run_stress(client: UartClient, args, tests: list,
+               setup: Setup, excluded: list) -> int:
+    if excluded:
+        ui.log(f"按角色（{setup.label}）排除 {len(excluded)} 条:")
+        for name, why in excluded:
+            ui.log(f"  - {name}（{why}）")
 
     if not tests:
-        ui.log("✗ 按 --tags 筛选后没有可跑的测试")
+        ui.log("✗ 筛选后没有可跑的测试")
+        if excluded:
+            # 全被角色排掉时最容易让人以为工具坏了，直接说清楚怎么办
+            ui.log(f"  所选测试都不适用于 {setup.label}。"
+                   f"换个 --tags，或确认 --role/--topology 给对了")
         return 1
 
     ui.log(f"本次要跑 {len(tests)} 条测试: " + "、".join(t.name for t in tests))
@@ -75,6 +88,7 @@ def run_stress(client: UartClient, args) -> int:
         "port": args.port, "baud": args.baud, "ssid": args.ssid or "",
         "tags": ",".join(args.tags or uart_tests.DEFAULT_TAGS),
         "cycles": args.cycles, "retry": args.retry, "timeout": args.timeout,
+        "role": setup.role.value, "topology": setup.topology.value,
     })
 
     failed_cycle = 0
@@ -84,7 +98,7 @@ def run_stress(client: UartClient, args) -> int:
 
     with ui.StatusBar() as bar:
         ctx = Ctx(client=client, ssid=args.ssid or "",
-                  password=args.password or "",
+                  password=args.password or "", setup=setup,
                   on_warn=lambda: bar.draw(**st.as_bar()))
 
         # 设备可能还连着上次的网络，先清干净再开始
@@ -176,6 +190,8 @@ def run_stress(client: UartClient, args) -> int:
     ui.log(f"告警次数: {st.warn}")
     ui.log(f"重试后成功的循环: {st.retried}")
     ui.log(f"累计重试次数: {st.retry}")
+    if ctx.checksum_errors:
+        ui.log(f"✗ 校验和错误: {ctx.checksum_errors} 次（线路质量问题）")
 
     if last:
         ui.log("最后一轮各条测试:")
@@ -229,7 +245,17 @@ def list_tests() -> int:
         needs = f"  ← 依赖 {'、'.join(t.needs)}" if t.needs else ""
         mark = " !!" if danger & set(t.tags) else "   "
         creds = " [需 -s/-w]" if t.needs_creds else ""
-        print(f" {mark}{i:3d}) {t.name:<18} [{','.join(t.tags)}]{creds}{needs}")
+        # 角色前提。写出来才看得懂为什么某个角色下这条不跑
+        pre = []
+        if t.roles:
+            pre.append("仅 " + "/".join(r.upper() for r in t.roles))
+        if t.needs_ap:
+            pre.append("需开热点")
+        if t.needs_sta:
+            pre.append("需连路由")
+        role = f" [{'、'.join(pre)}]" if pre else ""
+        print(f" {mark}{i:3d}) {t.name:<18} "
+              f"[{','.join(t.tags)}]{creds}{role}{needs}")
 
     print("\n各 tag 下的测试数:")
     line = []
@@ -241,8 +267,20 @@ def list_tests() -> int:
 
     print("\n  --tags query          只跑只读查询，最安全")
     print("  --tags display,audio  多个 tag 取并集")
+    print("  --tags remote         需先和对端配对，否则全超时")
     print("  --tags danger         !! 会改配置/重启设备，谨慎")
-    print("  依赖会自动带上，不用手动列\n")
+    print("  --tags logmode        !! 开 log 后设备不再回应任何命令")
+    print("  依赖会自动带上，不用手动列")
+
+    print("\n角色前提（--role / --topology 决定，不满足的直接不跑）:")
+    for s in ALL_SETUPS:
+        keep, exc = filter_by_setup(
+            filter_tests(tests, uart_tests.DEFAULT_TAGS), s)
+        allk, allx = filter_by_setup(tests, s)
+        print(f"  --role {s.role.value:<3} --topology {s.topology.value:<8} "
+              f"{s.label:<16} 全部 {len(allk):2}/{len(tests)} 条，"
+              f"默认组 {len(keep)}/{len(filter_tests(tests, uart_tests.DEFAULT_TAGS))} 条")
+    print("  开热点的那一方同时连路由，才跑得了完整 WiFi 流程。\n")
     return 0
 
 
@@ -254,7 +292,8 @@ def edit_line(prompt: str, initial: str) -> str:
     C 版为此手写了 60 行 termios raw 模式的行编辑器。
     """
     if readline is None:
-        print(f"  预填: {initial}")
+        if initial:                 # 空预填没什么可提示的，别刷屏
+            print(f"  预填: {initial}")
         return input(prompt)
 
     def hook():
@@ -273,8 +312,83 @@ def show_list() -> None:
     for group, items in cmds.grouped().items():
         print(f"\n  【{group}】")
         for i, c in items:
-            print(f"   {i:2d}) {c.label:<26} {c.hex}")
+            # ask 类没有固定字节，别摆一串示例十六进制假装能直接发
+            print(f"   {i:2d}) {c.label:<26} {c.hex or '<按提示输入>'}")
     print("\n  (!! 开头的指令有副作用)\n")
+
+
+# ---------------------------------------------------------------- 交互输入
+# SSID、密码这类东西没有合理的默认值。原来指令表里写死了示例值
+# （SSID=L-5G / psk=13456789 / abcd / 12345678），选中就直接发出去 ——
+# 结果是连一个不存在的网络，或者把设备热点改成示例值。这里改成现场问。
+
+# 加密方式。WPA+SAE 是实测设备接受的写法（WPA2-PSK + WPA3-SAE 兼容），
+# 即使扫描结果报的是 WPA-PSK 也用它 —— 所以放第一个当默认。
+AUTHEN_CHOICES = [
+    ("WPA+SAE", "WPA2/WPA3 兼容，实测可用（推荐）"),
+    ("WPA-PSK", "仅 WPA2"),
+]
+
+
+def ask_text(label: str, *, min_len: int = 1, max_len: int = 32,
+             default: str = "") -> str:
+    """问一个字符串，卡长度。Ctrl+C 抛 KeyboardInterrupt 由调用方兜。"""
+    while True:
+        s = edit_line(f"    {label}: ", default).strip()
+
+        if len(s) < min_len:
+            print(f"    ✗ 至少 {min_len} 个字符")
+            continue
+        if len(s) > max_len:
+            print(f"    ✗ 最多 {max_len} 个字符（输了 {len(s)}）")
+            continue
+        # data 是按字节发的，非 ASCII 会让长度和字符数不一致，
+        # 而设备侧的字段长度限制是按字节算的
+        if not s.isascii():
+            print("    ✗ 只支持 ASCII 字符")
+            continue
+        return s
+
+
+def ask_authen() -> str:
+    print("    加密方式:")
+    for i, (val, desc) in enumerate(AUTHEN_CHOICES, 1):
+        print(f"      {i}) {val:<9} {desc}")
+
+    while True:
+        s = input(f"    选择 [1-{len(AUTHEN_CHOICES)}, 默认 1]: ").strip()
+        if not s:
+            return AUTHEN_CHOICES[0][0]
+        if s.isdigit() and 1 <= int(s) <= len(AUTHEN_CHOICES):
+            return AUTHEN_CHOICES[int(s) - 1][0]
+        print("    ✗ 输入 1 或 2")
+
+
+def ask_wifi_connect() -> bytes:
+    ssid = ask_text("WiFi 名称 (SSID)")
+    authen = ask_authen()
+    # WPA 规范要求 8~63 位
+    pwd = ask_text("WiFi 密码", min_len=8, max_len=63)
+    return build_connect(ssid, pwd, authen).data
+
+
+def ask_ap_ssid() -> bytes:
+    print("    !! 这会改设备热点的持久配置")
+    return ask_text("新的热点 SSID").encode()
+
+
+def ask_ap_pwd() -> bytes:
+    print("    !! 这会改设备热点的持久配置")
+    return ask_text("新的热点密码", min_len=8, max_len=63).encode()
+
+
+# CmdDef.ask 里的名字 → 取 data 的函数。指令表只放名字，
+# 交互逻辑留在这个文件，两边不掺。
+ASK_HANDLERS = {
+    "wifi_connect": ask_wifi_connect,
+    "ap_ssid": ask_ap_ssid,
+    "ap_pwd": ask_ap_pwd,
+}
 
 
 def send_hex(client: UartClient, text: str) -> None:
@@ -292,12 +406,15 @@ def send_hex(client: UartClient, text: str) -> None:
 
     # 应答可能是多个包（比如扫描结果）。第一个包用正常超时等，后续包用短超时；
     # 读到超时就说明这次应答收完了 —— 所以后续超时要静默，它不是错误。
+    #
+    # 用 recv_raw 而不是 recv：指令模式手输的可能是任意 TAG，包括透传
+    # 那种结构完全不同的帧（57 AC ...）。走 recv 的话解析失败会把
+    # 应答字节整个丢掉，报成"没有收到应答" —— 而这里字节本身才是要看的东西。
     n = 0
     for i in range(MAX_LIST_PKTS):
-        got = client.recv(NOTIFY_TIMEOUT if i else None, quiet=bool(i))
-        if got is None:
+        rx = client.recv_raw(NOTIFY_TIMEOUT if i else None, quiet=bool(i))
+        if rx is None:
             break
-        _pkt, rx = got
         ui.log_hex("RX", rx)
         n += 1
 
@@ -312,6 +429,7 @@ def run_cmd_mode(client: UartClient) -> int:
     print("指令模式")
     print(f"  l          列出全部 {len(cmds.COMMANDS)} 条指令")
     print("  <编号>     选指令，自动预填十六进制，可修改后 Enter 发送")
+    print("             标 <按提示输入> 的会先问 SSID/密码这类参数")
     print("  <十六进制>  直接发送，如 47 54 00 00 25 86 01 00 0b")
     print("  q          退出")
     print("=" * 60)
@@ -335,11 +453,18 @@ def run_cmd_mode(client: UartClient) -> int:
         if line.isdigit() and 1 <= int(line) <= len(cmds.COMMANDS):
             c = cmds.COMMANDS[int(line) - 1]
             print(f"\n  [{c.group}] {c.label}")
-            print("  可修改，Enter 发送，Ctrl+C 取消")
             try:
-                send_hex(client, edit_line("  hex> ", c.hex))
+                hex_text = c.hex
+                if c.ask:
+                    # 先问出 data，再拼成十六进制交给下面统一编辑/发送 ——
+                    # 这样 ask 类指令也保留"发之前能看能改"的那一步
+                    data = ASK_HANDLERS[c.ask]()
+                    hex_text = hex_str(build(c.cmd, data, tag=c.tag).pack())
+
+                print("  可修改，Enter 发送，Ctrl+C 取消")
+                send_hex(client, edit_line("  hex> ", hex_text))
             except KeyboardInterrupt:
-                print("  ^取消")
+                print("\n  ^取消")
             print()
             continue
 
@@ -369,21 +494,37 @@ def parse_args(argv=None):
   %(prog)s -p /dev/ttyUSB0 --tags query -c 1
         只跑只读查询，最安全，不需要 -s/-w
 
-  %(prog)s -p /dev/ttyUSB0 -s MyWiFi -w pw123
+  %(prog)s -p /dev/ttyUSB0 --role rx --topology 1to1 -s MyWiFi -w pw123
         默认的 WiFi 老化流程（扫描→取结果→连接→忘记→切5G）跑 100 轮
+        不给 --role/--topology 会先提示选择
 
-  %(prog)s -p /dev/ttyUSB0 -s MyWiFi -w pw123 -c 500 -r 3
+  %(prog)s -p /dev/ttyUSB0 --role tx --topology 1tomany -s MyWiFi -w pw123 -c 500 -r 3
         长跑 500 轮，单轮失败最多重试 3 次，用于统计偶发失败率
 
   %(prog)s -p /dev/ttyUSB0 -i
         指令模式，手发十六进制调协议
+
+被测设备角色（必须，不给会在运行时提示选择）:
+  配对关系决定谁开热点，开热点的那一方同时也是 station 连路由，
+  给自己和连上它的对端提供上网和 OTA。另一方只连对端热点，不连路由。
+
+  --role rx --topology 1to1      Rx 开热点，Tx 连它        [完整 WiFi 流程]
+  --role tx --topology 1tomany   Tx 开 softap，多个 Rx 连它 [完整 WiFi 流程]
+  --role tx --topology 1to1      Tx 连 Rx 的热点            [不连路由]
+  --role rx --topology 1tomany   Rx 连 Tx 的热点            [不连路由]
+
+  不连路由的角色会自动跳过扫描/连接/忘记网络这套 —— 它们对这台设备
+  不适用，不是缺陷，所以直接不跑也不进报告。各角色能跑多少条见
+  --list-tests。
 
 按分类跑:
   --tags query              只读查询，最安全
   --tags display            旋转/缩放/HDMI/HDCP
   --tags audio,net          多个 tag 取并集
   --tags core -c 500 -r 3   WiFi 老化长跑
+  --tags remote             Remote 指令，需先和对端配对否则全超时
   --tags danger             !! 会改配置或重启设备，谨慎
+  --tags logmode            !! 开 log 后设备不再回应任何命令
 
   完整 tag 列表和每组条数见 --list-tests。
   被选中的测试如果依赖了别的测试，依赖会自动带上。
@@ -392,6 +533,7 @@ def parse_args(argv=None):
   -t 45          设备慢时放宽单命令超时
   -l run1.log    分开保存日志，便于对比多次运行
   -b 9600        非默认波特率
+  --tx-checksum  发送时填真校验和（默认 00 00，接收端忽略）
 
 日志:
   所有收发带毫秒时间戳写入 test.log（单行完整十六进制，便于 grep）。
@@ -426,6 +568,10 @@ def parse_args(argv=None):
     p.add_argument("--tags", type=lambda s: s.split(","), metavar="a,b",
                    help="只跑带这些 tag 的测试，逗号分隔取并集。"
                         "依赖会自动带上。不给就跑默认组")
+    p.add_argument("--tx-checksum", action="store_true",
+                   help="发送时填真校验和（spec 3.2 规则）。默认填 00 00 ——"
+                        "接收端会忽略它，而 00 00 的格式实测长跑通过。"
+                        "接收方向的校验和**始终**会验")
     p.add_argument("--no-restore", action="store_true",
                    help="跑完不恢复基线状态。默认会把区域码/频段/模式/HDMI/"
                         "旋转/缩放/静音/log 设回已知值，避免设备停在被改过的状态")
@@ -434,6 +580,12 @@ def parse_args(argv=None):
                         "供脚本分析或趋势对比")
     p.add_argument("--report-junit", metavar="文件",
                    help="把结果写成 JUnit XML，Jenkins / GitLab CI 可直接展示")
+    p.add_argument("--role", choices=[r.value for r in Role], metavar="tx|rx",
+                   help="被测设备是发送端还是接收端。不给会在运行时提示选择")
+    p.add_argument("--topology", choices=[t.value for t in Topology],
+                   metavar="1to1|1tomany",
+                   help="配对拓扑。决定谁开热点：一对一 Rx 开、一对多 Tx 开。"
+                        "不给会在运行时提示选择")
     p.add_argument("--list-tests", action="store_true",
                    help="列出全部测试、依赖关系和 tag 后退出，不需要接设备")
 
@@ -444,22 +596,86 @@ def parse_args(argv=None):
     if not args.port:
         p.error("需要 -p 指定串口（或用 --list-tests 只看测试列表）")
 
-    # 只有真的会用到 ssid/password 的测试才强制要它们。
-    # 按 needs_creds 判断而不是按 tag —— "查询 WiFi状态"归类是 wifi，
-    # 但它是只读查询，不需要任何凭据。
-    if not args.interactive:
-        selected = filter_tests(uart_tests.TESTS,
-                                args.tags or uart_tests.DEFAULT_TAGS)
-        need = [t.name for t in selected if t.needs_creds]
-
-        if need and not (args.ssid and args.password):
-            p.error(f"这些测试需要 -s 和 -w: {'、'.join(need)}\n"
-                    f"（想跳过就别选它们，比如 --tags query 只跑只读查询）")
-
     if args.retry < 0:
         args.retry = 0
 
     return args
+
+
+# ------------------------------------------------------------ 角色
+def ask_setup() -> Setup:
+    """没给 --role / --topology 时提示选择。
+
+    这个选择必须问清楚：选错了整批 WiFi 测试会全部超时，而超时看起来
+    像设备坏了，不像参数给错了。所以先把配对关系讲明白再让人选。
+    """
+    print("\n" + "=" * 60)
+    print("被测设备的角色")
+    print(role_guidance().rstrip())
+    print()
+    for line in role_menu_lines():
+        print(line)
+    print("=" * 60)
+
+    while True:
+        try:
+            s = input(f"选择 [1-{len(ALL_SETUPS)}]: ").strip()
+        except EOFError:
+            # 读不到输入就没法猜 —— 猜错了是整批 WiFi 测试超时。
+            # isatty 在 Windows 上对 `< /dev/null` 会误报成终端，
+            # 所以这里必须再兜一层。
+            raise SystemExit("\n" + NO_ROLE_HELP)
+
+        if s.isdigit() and 1 <= int(s) <= len(ALL_SETUPS):
+            return ALL_SETUPS[int(s) - 1]
+        print(f"  ✗ 输入 1 到 {len(ALL_SETUPS)}")
+
+
+NO_ROLE_HELP = (
+    "✗ 没有指定被测设备角色，也读不到输入。请加参数:\n"
+    "    --role rx --topology 1to1      Rx 开热点，Tx 连它\n"
+    "    --role tx --topology 1tomany   Tx 开 softap，多个 Rx 连它\n"
+    "    --role tx --topology 1to1      Tx 连 Rx 的热点，不连路由\n"
+    "    --role rx --topology 1tomany   Rx 连 Tx 的热点，不连路由\n"
+    "  开热点的那一方同时连路由，才跑得了完整 WiFi 流程。")
+
+
+def resolve_setup(args) -> Setup:
+    """定出被测设备的角色：命令行给了就用，没给就提示。
+
+    非交互环境（CI、管道）不能停下来等输入 —— 那会挂住或者读到 EOF，
+    症状比"参数没给"难查得多。所以直接报错并说清楚该加什么参数。
+    """
+    setup = parse_setup(args.role, args.topology)
+    if setup is not None:
+        return setup
+
+    if not sys.stdin.isatty():
+        raise SystemExit(NO_ROLE_HELP)
+
+    return ask_setup()
+
+
+def select_tests(args, setup: Setup) -> tuple:
+    """按 --tags 再按角色筛出本次要跑的测试。返回 ``(tests, excluded)``。"""
+    tests = filter_tests(uart_tests.TESTS, args.tags or uart_tests.DEFAULT_TAGS)
+    return filter_by_setup(tests, setup)
+
+
+def check_creds(args, tests: list) -> None:
+    """只有真的会用到 ssid/password 的测试才强制要它们。
+
+    按 needs_creds 判断而不是按 tag —— "查询 WiFi状态"归类是 wifi，
+    但它是只读查询，不需要任何凭据。
+
+    而且必须在**角色筛选之后**才检查：一台不连路由的设备（一对一的 Tx、
+    一对多的 Rx）压根不会跑"连接网络"，却被要求给 -s/-w 就很莫名。
+    """
+    need = [t.name for t in tests if t.needs_creds]
+    if need and not (args.ssid and args.password):
+        raise SystemExit(
+            f"✗ 这些测试需要 -s 和 -w: {'、'.join(need)}\n"
+            f"  想跳过就别选它们，比如 --tags query 只跑只读查询")
 
 
 def main(argv=None) -> int:
@@ -471,6 +687,14 @@ def main(argv=None) -> int:
     if args.list_tests:
         return list_tests()
 
+    # 角色要在开日志、开串口之前定下来：它决定跑哪些测试，也决定
+    # 要不要 -s/-w。提示菜单不该混在测试日志里。
+    setup, tests, excluded = None, [], []
+    if not args.interactive:
+        setup = resolve_setup(args)
+        tests, excluded = select_tests(args, setup)
+        check_creds(args, tests)
+
     ui.init(args.log)
 
     ui.log(f"UART 测试 | Port: {args.port} | Baud: {args.baud}")
@@ -479,22 +703,26 @@ def main(argv=None) -> int:
     else:
         ui.log(f"模式: 测试集 | SSID: {args.ssid} | "
                f"tags={args.tags or uart_tests.DEFAULT_TAGS}")
+        ui.log(f"角色: {setup.label}")
+        ui.log(f"  {setup.describe()}")
         ui.log(f"Timeout: {args.timeout}s | Cycles: {args.cycles} | "
                f"Retry: {args.retry}")
     ui.log("=" * 60)
 
     try:
-        with UartClient(args.port, args.baud, args.timeout, log=ui.log) as c:
+        with UartClient(args.port, args.baud, args.timeout, log=ui.log,
+                        tx_checksum=args.tx_checksum) as c:
             if args.interactive:
                 return run_cmd_mode(c)
 
             print("\n" + "=" * 60)
             print(f"启动测试\n目标设备: {args.port}\nWiFi SSID: {args.ssid}")
+            print(f"角色: {setup.label}")
             print(f"最大循环数: {args.cycles}\n单命令超时: {args.timeout}s")
             print(f"失败重试次数: {args.retry}")
             print("=" * 60 + "\n")
 
-            return run_stress(c, args)
+            return run_stress(c, args, tests, setup, excluded)
 
     except KeyboardInterrupt:
         ui.log("\n■ 被 Ctrl+C 中断")

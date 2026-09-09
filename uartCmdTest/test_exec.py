@@ -19,7 +19,9 @@ from uart_exec import (
     filter_tests, query_hex, query_int, query_str, restore_baseline,
     run_suite, set_and_restore, set_and_verify, simple,
 )
-from uart_protocol import Cmd, Err, Packet, resp_id_of
+from uart_protocol import (
+    Cmd, Err, Packet, TAG_LOCAL, Tag, resp_id_of, tag_bytes,
+)
 
 
 class FakeClient:
@@ -51,7 +53,11 @@ class FakeClient:
             if not isinstance(data, list):
                 data = [data]
             for d in data:
-                self._queue.append(Packet(resp_id_of(pkt.cmd_id), d).pack())
+                # 应答带和请求一样的 TAG（spec 的 TAG 表里一个值同时是
+                # request 和 ack 的标记）
+                self._queue.append(
+                    Packet(resp_id_of(pkt.cmd_id), d, tag=pkt.tag)
+                    .pack(with_checksum=True))
 
         return pkt.pack()
 
@@ -171,11 +177,12 @@ class StatefulDev:
         c, d = pkt.cmd_id, pkt.data
         if d:                                   # 设置
             self.state[c] = d[0]
-            self._q.append(Packet(resp_id_of(c), OK).pack())
+            self._q.append(Packet(resp_id_of(c), OK).pack(with_checksum=True))
         else:                                   # 查询
             v = self.state.get(c, 0)
             self._q.append(
-                Packet(resp_id_of(c), b"\x00\x00" + bytes([v])).pack())
+                Packet(resp_id_of(c), b"\x00\x00" + bytes([v])
+                       ).pack(with_checksum=True))
         return pkt.pack()
 
     def recv(self, timeout=None, quiet=False):
@@ -401,8 +408,9 @@ class TestAsyncNotificationSkipping(unittest.TestCase):
         c = FakeClient()
         c.send(Packet(Cmd.NET_STA_CTRL, b"\x00"))
         c._queue = [
-            Packet(resp_id_of(Cmd.FW_UPGRADE_CTRL), b"\x00\x00ver").pack(),
-            Packet(resp_id_of(Cmd.NET_STA_CTRL), OK).pack(),
+            Packet(resp_id_of(Cmd.FW_UPGRADE_CTRL),
+                   b"\x00\x00ver").pack(with_checksum=True),
+            Packet(resp_id_of(Cmd.NET_STA_CTRL), OK).pack(with_checksum=True),
         ]
         ctx = Ctx(client=c)
         pkt = quiet_run(ctx.recv_reply, resp_id_of(Cmd.NET_STA_CTRL))
@@ -459,6 +467,120 @@ class TestRunSuite(unittest.TestCase):
 
         with self.assertRaises(Aborted):
             quiet_run(run_suite, Ctx(client=FakeClient()), [Test("x", boom)])
+
+
+class TestTagMatching(unittest.TestCase):
+    """应答按 (Command ID, TAG) 两者匹配。
+
+    1 对多时对端们的应答会和本地应答挤在同一条串口上，只比 ID 就会
+    把对端的应答当成本地的 —— 那之后每一步都在读上一条的应答。
+    """
+
+    class TagDev:
+        """按指定的 TAG 列表依次回应答，Command ID 一律匹配。"""
+
+        def __init__(self, tags):
+            self.tags = list(tags)
+            self._q = []
+
+        def flush_input(self):
+            self._q.clear()
+
+        def send(self, pkt):
+            for t in self.tags:
+                self._q.append(
+                    Packet(resp_id_of(pkt.cmd_id), OK, tag=tag_bytes(t))
+                    .pack(with_checksum=True))
+            return pkt.pack()
+
+        def recv(self, timeout=None, quiet=False):
+            if not self._q:
+                return None
+            raw = self._q.pop(0)
+            return Packet.unpack(raw), raw
+
+    def test_local_request_ignores_remote_ack(self):
+        """只有对端应答时，本地请求必须超时失败，不能拿它当成功。"""
+        ctx = Ctx(client=self.TagDev([Tag.PL, Tag.PP]))
+        with self.assertRaises(TestFailed):
+            quiet_run(simple(Cmd.AUDIO_MUTE, b"\x01"), ctx)
+
+    def test_local_ack_found_after_remote_ones(self):
+        """对端应答先到也不该乱 —— 跳过它们，继续等本地的。"""
+        ctx = Ctx(client=self.TagDev([Tag.PL, Tag.PP, Tag.TG]))
+        quiet_run(simple(Cmd.AUDIO_MUTE, b"\x01"), ctx)
+
+    def test_remote_request_matches_remote_ack(self):
+        ctx = Ctx(client=self.TagDev([Tag.PL]))
+        pkt = quiet_run(ctx.remote_step, Cmd.AUDIO_MUTE, b"\x01")
+        self.assertEqual(pkt.tag, tag_bytes(Tag.PL))
+
+    def test_remote_request_ignores_local_ack(self):
+        """反向也要成立：发给对端的命令不能被本地 AM 的应答顶掉。"""
+        ctx = Ctx(client=self.TagDev([Tag.TG]))
+        with self.assertRaises(TestFailed):
+            quiet_run(ctx.remote_step, Cmd.AUDIO_MUTE, b"\x01")
+
+    def test_remote_to_mcu_uses_pp(self):
+        c = FakeClient(default=OK)
+        ctx = Ctx(client=c)
+        pkt = quiet_run(ctx.remote_step, Cmd.AUDIO_MUTE, b"\x01", to_mcu=True)
+        self.assertEqual(pkt.tag, tag_bytes(Tag.PP))
+
+    def test_step_defaults_to_local(self):
+        c = FakeClient(default=OK)
+        pkt = quiet_run(Ctx(client=c).step, Cmd.AUDIO_MUTE, b"\x01")
+        self.assertEqual(pkt.tag, TAG_LOCAL)
+
+
+class TestChecksumVerification(unittest.TestCase):
+    """接收方向的校验和校验。
+
+    不校验的话会拿着错数据往下跑，而且症状会伪装成"设备返回了奇怪的值"，
+    非常难查 —— 所以这一层必须在 Ctx.recv 里拦住。
+    """
+
+    class CorruptDev:
+        """回一个校验和不对的包（模拟线上字节损坏）。"""
+
+        def __init__(self, corrupt=True):
+            self.corrupt = corrupt
+            self._q = []
+
+        def flush_input(self):
+            self._q.clear()
+
+        def send(self, pkt):
+            raw = bytearray(Packet(resp_id_of(pkt.cmd_id), OK)
+                            .pack(with_checksum=True))
+            if self.corrupt:
+                raw[-1] ^= 0x01          # 翻一个数据位，校验和就对不上
+            self._q.append(bytes(raw))
+            return pkt.pack()
+
+        def recv(self, timeout=None, quiet=False):
+            if not self._q:
+                return None
+            raw = self._q.pop(0)
+            return Packet.unpack(raw), raw
+
+    def test_corrupt_packet_rejected(self):
+        ctx = Ctx(client=self.CorruptDev(corrupt=True))
+        with self.assertRaises(TestFailed):
+            quiet_run(simple(Cmd.AUDIO_MUTE, b"\x01"), ctx)
+        self.assertEqual(ctx.checksum_errors, 1)
+
+    def test_good_packet_passes(self):
+        ctx = Ctx(client=self.CorruptDev(corrupt=False))
+        quiet_run(simple(Cmd.AUDIO_MUTE, b"\x01"), ctx)
+        self.assertEqual(ctx.checksum_errors, 0)
+
+    def test_error_counted_per_packet(self):
+        ctx = Ctx(client=self.CorruptDev(corrupt=True))
+        for _ in range(3):
+            with self.assertRaises(TestFailed):
+                quiet_run(simple(Cmd.AUDIO_MUTE, b"\x01"), ctx)
+        self.assertEqual(ctx.checksum_errors, 3)
 
 
 class TestMaxDuration(unittest.TestCase):
@@ -574,6 +696,55 @@ class TestSuiteDefinition(unittest.TestCase):
     def test_default_tags_select_something(self):
         sel = filter_tests(uart_tests.TESTS, uart_tests.DEFAULT_TAGS)
         self.assertGreater(len(sel), 0)
+
+    def test_all_exclusive_tags_are_isolated(self):
+        """DANGER_TAGS 里的每个 tag 都必须是独占的。
+
+        一身兼两职的 tag 是真踩过的坑（wifi 既表示分类又表示"要凭据"）。
+        这里对所有需要显式点名的 tag 统一卡住，加新的也自动被覆盖。
+        """
+        exclusive = set(uart_tests.DANGER_TAGS)
+        for t in uart_tests.TESTS:
+            extra = set(t.tags) & exclusive
+            if extra:
+                self.assertEqual(
+                    set(t.tags), extra,
+                    f"{t.name} 带了独占 tag {extra}，却还有 "
+                    f"{set(t.tags) - extra} —— 会被别的 --tags 误触发")
+
+    def test_logmode_never_reachable_by_other_tags(self):
+        """打开 log 后设备不再回应任何命令，整轮测试就地死掉。
+
+        所以除了显式 --tags logmode，任何 tag 都不能把它们拉进来 ——
+        包括依赖自动展开这条路径。
+        """
+        for tag in uart_tests.all_tags():
+            if tag == "logmode":
+                continue
+            hit = [t.name for t in filter_tests(uart_tests.TESTS, [tag])
+                   if "logmode" in t.tags]
+            self.assertEqual(hit, [], f"--tags {tag} 会跑到 log 设置: {hit}")
+
+    def test_baseline_never_enables_log(self):
+        """基线里绝不能出现 log 设置。
+
+        原来有一条"恢复成 log 全开"，等于每轮收尾都把命令通道弄死 ——
+        而且是在所有测试都跑完之后，报告一切正常，设备已经失联。
+        """
+        for name, cmd, _data in uart_tests.BASELINE:
+            self.assertNotIn(
+                int(cmd), (int(Cmd.SET_LOG_STATUS), int(Cmd.NULL_CONSOLE)),
+                f"基线项 {name!r} 在设置 log")
+
+    def test_baseline_data_is_explicit_bytes(self):
+        """基线的 data 必须是实际字节，不能是空的。
+
+        这张表全是控制字节，历史上被写成过裸 0x03（编辑器里看不见），
+        也被写成过空 data —— 后者会把"设置"悄悄变成"查询"，
+        恢复根本没发生，而日志照样报成功。
+        """
+        for name, _cmd, data in uart_tests.BASELINE:
+            self.assertGreater(len(data), 0, f"基线项 {name!r} 的 data 是空的")
 
     def test_only_connect_needs_creds(self):
         """needs_creds 要按实际用途标，不能靠 tag 推断。"""

@@ -20,9 +20,10 @@ import unittest
 
 from uart_protocol import (
     Cmd, Err, Packet, STA_CONNECT, STA_FORGET, STA_SCAN, STA_SCAN_RESULT,
-    STATE_NOTIFY_DATA, WIFI_CHN_5G,
-    build, build_connect, err_name, hex_str, network_count, parse_hex,
-    parse_scan_list, resp_id_of,
+    STATE_NOTIFY_DATA, TAG_LOCAL, Tag, WIFI_CHN_5G,
+    build, build_connect, build_remote, checksum_of, err_name, hex_str,
+    network_count, parse_hex, parse_scan_list, resp_id_of, tag_bytes,
+    tag_name, tag_value,
 )
 
 
@@ -32,8 +33,13 @@ def tx(cmd, data=b""):
 
 
 def rx(cmd, data):
-    """构造一个应答包（用文档里的 data 喂进来）。"""
-    return Packet.unpack(Packet(resp_id_of(cmd), data).pack())
+    """构造一个应答包（用文档里的 data 喂进来）。
+
+    带真校验和 —— 真设备发的包校验和是对的，假包也得对，
+    否则会被 checksum 校验判成损坏。
+    """
+    return Packet.unpack(
+        Packet(resp_id_of(cmd), data).pack(with_checksum=True))
 
 
 class TestCommandBytes(unittest.TestCase):
@@ -208,6 +214,211 @@ class TestReturnCode(unittest.TestCase):
         self.assertEqual(err_name(-8), "INCORRECT_PWD(密码错)")
         self.assertEqual(err_name(-11), "PACKET_DONE(分包结束)")
         self.assertIn("未知", err_name(99))       # 未知值也要能安全打印
+
+
+class TestChecksum(unittest.TestCase):
+    """spec 3.2：除 checksum 字段本身外所有字节相加，截断到 16 位。
+
+    期望值全部来自 spec 的例子和 test1.log 的真实应答。
+    """
+
+    def test_spec_example(self):
+        """spec 3.2 给的算例: 0x47+0x54+0x01+0x8C+0xFF+0xFF = 0x0326"""
+        self.assertEqual(0x47 + 0x54 + 0x01 + 0x8C + 0xFF + 0xFF, 0x0326)
+        self.assertEqual(
+            checksum_of(parse_hex("47 54 26 03 01 8C FF FF")), 0x0326)
+
+    def test_real_captures(self):
+        """test1.log 里的真实应答，字段值 == 重算值。"""
+        for raw in (
+            "47 54 21 01 23 42 07 00 00 00 00 1A 00 00 00",   # 扫描应答
+            "47 54 03 01 23 42 02 00 01 00",                  # 忘记 ack
+            "47 54 F6 02 23 42 02 00 F5 FF",                  # 列表结束
+            "47 54 0B 01 23 42 05 00 00 00 06 00 00",         # 状态通知
+            "47 54 0B 01 25 48 02 00 01 00",                  # 5G 应答
+        ):
+            with self.subTest(raw=raw[:20]):
+                b = parse_hex(raw)
+                field = struct.unpack_from("<H", b, 2)[0]
+                self.assertEqual(field, checksum_of(b))
+                self.assertTrue(Packet.unpack(b).checksum_ok)
+
+    def test_truncates_to_16_bits(self):
+        """字段只有 2 字节，大包的和必须截断 —— 1024 字节理论上能加到 26 万。"""
+        big = parse_hex("47 54 00 00 23 82 F8 03") + b"\xFF" * 1016
+        self.assertLessEqual(checksum_of(big), 0xFFFF)
+
+    def test_detects_corruption(self):
+        """改一个数据字节，校验和就对不上 —— 这正是要抓的。"""
+        good = parse_hex("47 54 21 01 23 42 07 00 00 00 00 1A 00 00 00")
+        self.assertTrue(Packet.unpack(good).checksum_ok)
+
+        bad = bytearray(good)
+        bad[11] ^= 0x01                      # 把网络个数从 0x1A 改成 0x1B
+        self.assertFalse(Packet.unpack(bytes(bad)).checksum_ok)
+
+    def test_corruption_in_header_detected(self):
+        good = parse_hex("47 54 03 01 23 42 02 00 01 00")
+        bad = bytearray(good)
+        bad[4] ^= 0x10                       # 改 Command ID
+        self.assertFalse(Packet.unpack(bytes(bad)).checksum_ok)
+
+    def test_pack_default_is_zero(self):
+        """默认发 00 00：接收端忽略校验和，而这个格式实测长跑通过。"""
+        raw = build(Cmd.NET_STA_CTRL, bytes([STA_SCAN])).pack()
+        self.assertEqual(raw[2:4], b"\x00\x00")
+
+    def test_pack_with_checksum_is_self_consistent(self):
+        for data in (b"", b"\x00", bytes(range(64)), b"\xFF" * 300):
+            with self.subTest(n=len(data)):
+                raw = build(Cmd.NET_STA_CTRL, data).pack(with_checksum=True)
+                field = struct.unpack_from("<H", raw, 2)[0]
+                self.assertEqual(field, checksum_of(raw))
+                self.assertTrue(Packet.unpack(raw).checksum_ok)
+
+    def test_trailing_bytes_excluded(self):
+        """校验和只覆盖包声明的长度，多出来的尾部字节不参与。"""
+        raw = parse_hex("47 54 03 01 23 42 02 00 01 00") + b"\xAA\xBB"
+        self.assertTrue(Packet.unpack(raw).checksum_ok)
+
+    def test_constructed_packet_defaults_ok(self):
+        """自己构造的包没算过校验和，不该被当成损坏。"""
+        self.assertTrue(build(Cmd.ROTATION, b"\x01").checksum_ok)
+
+
+class TestTag(unittest.TestCase):
+    """TAG 决定命令由谁执行 —— 本地 AM、对端 AM，还是对端的 MCU。
+
+    数值取自 spec 的 TAG 表，**小端写到线上**。这里的字节期望值是手算的，
+    不是从代码反过来生成的。
+    """
+
+    # spec TAG 表：数值 → 线上字节 → 两字母码（按线上字节序读）
+    WIRE = {
+        Tag.TG: (b"\x47\x54", "TG"),        # 47 54 = "GT"，本地
+        Tag.PL: (b"\x50\x4C", "PL"),        # 对端 AM 执行
+        Tag.PP: (b"\x50\x50", "PP"),        # 对端 MCU 执行
+        Tag.LP: (b"\x4C\x50", "LP"),
+        Tag.LL: (b"\x4C\x4C", "LL"),
+    }
+
+    def test_wire_bytes_are_little_endian(self):
+        for tag, (wire, _name) in self.WIRE.items():
+            with self.subTest(tag=tag.name):
+                self.assertEqual(tag_bytes(tag), wire)
+                self.assertEqual(tag_value(wire), int(tag))
+
+    def test_names(self):
+        for tag, (_wire, name) in self.WIRE.items():
+            self.assertEqual(tag_name(tag), name)
+        self.assertEqual(tag_name(0x1234), "0x1234")
+
+    def test_default_tag_is_local(self):
+        """默认必须是本地 —— 现有 76 条测试全靠这个默认值。"""
+        self.assertEqual(TAG_LOCAL, b"\x47\x54")
+        self.assertEqual(build(Cmd.AUDIO_MUTE, b"\x01").tag, TAG_LOCAL)
+
+    def test_tag_goes_on_the_wire(self):
+        """整包字节：只有前两字节随 TAG 变，其余不动。"""
+        self.assertEqual(hex_str(build(Cmd.AUDIO_MUTE, b"\x01").pack()),
+                         "47 54 00 00 01 81 01 00 01")
+        self.assertEqual(
+            hex_str(build(Cmd.AUDIO_MUTE, b"\x01", tag=Tag.PL).pack()),
+            "50 4C 00 00 01 81 01 00 01")
+        self.assertEqual(
+            hex_str(build(Cmd.AUDIO_MUTE, b"\x01", tag=Tag.PP).pack()),
+            "50 50 00 00 01 81 01 00 01")
+
+    def test_build_remote(self):
+        self.assertEqual(build_remote(Cmd.AUDIO_MUTE).tag, tag_bytes(Tag.PL))
+        self.assertEqual(build_remote(Cmd.AUDIO_MUTE, to_mcu=True).tag,
+                         tag_bytes(Tag.PP))
+
+    def test_round_trip_preserves_tag(self):
+        for tag in self.WIRE:
+            with self.subTest(tag=tag.name):
+                pkt = build(Cmd.DEV_NAME, b"x", tag=tag)
+                back = Packet.unpack(pkt.pack(with_checksum=True))
+                self.assertEqual(back.tag, tag_bytes(tag))
+                self.assertEqual(back.tag_value, int(tag))
+                self.assertTrue(back.checksum_ok)
+
+    def test_checksum_covers_tag(self):
+        """TAG 在校验和覆盖范围内（spec: 除 checksum 字段外全部相加）。
+
+        换个 TAG 校验和必须跟着变，否则改 TAG 的包会带着旧校验和过去。
+        """
+        a = build(Cmd.AUDIO_MUTE, b"\x01", tag=Tag.TG).pack(with_checksum=True)
+        b = build(Cmd.AUDIO_MUTE, b"\x01", tag=Tag.PL).pack(with_checksum=True)
+        self.assertNotEqual(a[2:4], b[2:4])
+        for raw in (a, b):
+            self.assertTrue(Packet.unpack(raw).checksum_ok)
+
+    def test_unknown_tag_rejected(self):
+        """认不出的 TAG 说明流已经错位，不能按命令包往下解。"""
+        raw = bytearray(build(Cmd.AUDIO_MUTE, b"\x01").pack())
+        raw[0:2] = b"\xAB\xCD"
+        with self.assertRaises(ValueError):
+            Packet.unpack(bytes(raw))
+
+    def test_passthrough_tag_rejected_as_command(self):
+        """透传包的结构不是 8 字节包头，按命令包解会读出垃圾长度。"""
+        raw = bytearray(build(Cmd.AUDIO_MUTE, b"\x01").pack())
+        raw[0:2] = tag_bytes(Tag.PASSTHRU)
+        with self.assertRaises(ValueError):
+            Packet.unpack(bytes(raw))
+
+    def test_is_remote(self):
+        self.assertFalse(build(Cmd.AUDIO_MUTE).is_remote)
+        for tag in (Tag.PL, Tag.PP, Tag.LP, Tag.LL):
+            self.assertTrue(build(Cmd.AUDIO_MUTE, tag=tag).is_remote)
+
+    def test_str_marks_only_non_local(self):
+        """本地包是绝大多数，标 TAG 只会刷屏；非本地的必须能一眼看出。"""
+        self.assertNotIn("[", str(build(Cmd.AUDIO_MUTE, b"\x01")))
+        self.assertIn("[PL]", str(build(Cmd.AUDIO_MUTE, b"\x01", tag=Tag.PL)))
+
+
+class TestRemotePtpExamples(unittest.TestCase):
+    """字节期望值直接抄自 Remote_Rx.ptp / Remote_Tx.ptp。
+
+    这两个是 doclight 的实测用例，属于最硬的参照 —— 比 spec 表格更可信，
+    因为它们是真的发出去过的字节。
+    """
+
+    def test_remote_rx(self):
+        cases = [
+            # Remote_Rx_ROTATE_GET
+            ("50 4C 00 00 23 88 FF FF", Cmd.ROTATION, b""),
+            # Remote_Rx_R90 / R270
+            ("50 4C 00 00 23 88 01 00 01", Cmd.ROTATION, b"\x01"),
+            ("50 4C 00 00 23 88 01 00 03", Cmd.ROTATION, b"\x03"),
+            # Remote_Rx_Get_Overscan
+            ("50 4C 00 00 29 88 FF FF", Cmd.SET_OVERSCAN, b""),
+            # Remote_Rx_Get_MAC
+            ("50 4C 00 00 10 82 FF FF", Cmd.WIFI_MAC_ADDR, b""),
+        ]
+        for want, cmd, data in cases:
+            with self.subTest(want=want):
+                self.assertEqual(hex_str(build_remote(cmd, data).pack()), want)
+
+    def test_remote_tx(self):
+        # Remote_Tx_Get_SSID 用的是 0x820D，不是 spec v1.8 写的 0x820C ——
+        # 实测用例和固件枚举一致，代码跟这边。
+        self.assertEqual(hex_str(build_remote(Cmd.TX_SSID).pack()),
+                         "50 4C 00 00 0D 82 FF FF")
+        self.assertEqual(hex_str(build_remote(Cmd.WIFI_MAC_ADDR).pack()),
+                         "50 4C 00 00 10 82 FF FF")
+
+    def test_remote_mcu_uses_pp(self):
+        """Remote_MCU_TEST: ``50 50 00 00 01 02 00 00``。
+
+        TAG 和 Command ID 都对得上。data_len 那边填的是 ``00 00`` 而我们
+        无数据时填 ``FF FF``（spec 规定的查询写法）—— 对端 MCU 那条路
+        还没有实测过，等真要测 MCU 透传时再确认该用哪个。
+        """
+        raw = build_remote(0x0201, to_mcu=True).pack()
+        self.assertEqual(hex_str(raw)[:17], "50 50 00 00 01 02")
 
 
 class TestNetworkCount(unittest.TestCase):

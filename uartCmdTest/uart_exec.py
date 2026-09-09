@@ -17,7 +17,8 @@ from typing import Any, Callable, Optional
 
 import uart_ui as ui
 from uart_protocol import (
-    Cmd, Packet, STA_FORGET, build, err_name, resp_id_of,
+    Cmd, Packet, STA_FORGET, TAG_LOCAL, Tag, build, checksum_of, err_name,
+    resp_id_of, tag_name, tag_value,
 )
 
 # 刻意不 import uart_serial：Ctx 只用到 client 的 send/recv/flush_input 三个方法，
@@ -76,6 +77,14 @@ class Test:
                   老化测试里性能退化是真实的失效模式：设备还在回应、
                   返回码也对，但连接从 5 秒变成 25 秒。只看通过/失败
                   发现不了，必须卡时延。
+
+    下面三个是**角色前提**：不满足时这条测试根本不该跑，而不是跑了算失败。
+    被排除的测试在报告里不出现 —— "这台设备本来就不做这件事"不是缺陷。
+
+    :param roles: 限定 Role。空 = 不限。例如查 Tx 版本只在 Tx 上有意义。
+    :param needs_ap:  需要本机开热点（改热点 SSID/密码这类）
+    :param needs_sta: 需要本机作为 station 连路由（扫描/连接/忘记网络）。
+                  只有开热点的那一方才连路由，另一方连的是对端的热点。
     """
     name: str
     run: Callable[["Ctx"], None]
@@ -83,20 +92,47 @@ class Test:
     tags: tuple = ()
     needs_creds: bool = False
     max_duration: Optional[float] = None
+    roles: tuple = ()
+    needs_ap: bool = False
+    needs_sta: bool = False
+
+    def applies_to(self, setup) -> bool:
+        """这条测试在给定角色下有没有意义。setup 为 None 时一律有。"""
+        if setup is None:
+            return True
+        if self.roles and setup.role.value not in self.roles:
+            return False
+        if self.needs_ap and not setup.is_ap:
+            return False
+        if self.needs_sta and not setup.is_sta:
+            return False
+        return True
+
+    def why_excluded(self, setup) -> str:
+        """被角色排除的原因，用于告诉用户少跑了什么、为什么。"""
+        if self.roles and setup.role.value not in self.roles:
+            want = "/".join(r.upper() for r in self.roles)
+            return f"只适用于 {want}"
+        if self.needs_ap and not setup.is_ap:
+            return "需要本机开热点"
+        if self.needs_sta and not setup.is_sta:
+            return "需要本机连路由"
+        return ""
 
 
-def simple(cmd: int, data: bytes = b""):
+def simple(cmd: int, data: bytes = b"", tag: int = Tag.TG):
     """只看返回码的测试，一行生成。data 留空即查询指令。
 
     设置类命令用它就够了 —— 应答是 ``rc=1 SUCCESS``，没有别的内容。
     """
-    return lambda ctx: ctx.step(cmd, data)
+    return lambda ctx: ctx.step(cmd, data, tag=tag)
 
 
 def query_int(cmd: int, size: int = 1, offset: int = 0,
               unit: str = "", names: Optional[dict] = None,
               expect: Optional[int] = None, allowed=None,
-              lo: Optional[int] = None, hi: Optional[int] = None):
+              lo: Optional[int] = None, hi: Optional[int] = None,
+              tag: int = Tag.TG):
     """查询指令，解析返回的整数并可选地断言。
 
     应答布局是 ``rc(2) + [填充] + 值(小端)``::
@@ -126,7 +162,7 @@ def query_int(cmd: int, size: int = 1, offset: int = 0,
         allowed = set(allowed)
 
     def run(ctx: "Ctx") -> None:
-        pkt = ctx.step(cmd)
+        pkt = ctx.step(cmd, tag=tag)
         start = 2 + offset
         raw = pkt.data[start:start + size]
 
@@ -157,7 +193,8 @@ def query_int(cmd: int, size: int = 1, offset: int = 0,
 
 
 def query_str(cmd: int, expect: Optional[str] = None,
-              pattern: Optional[str] = None, min_len: int = 1):
+              pattern: Optional[str] = None, min_len: int = 1,
+              tag: int = Tag.TG):
     """查询指令，解析返回的 ASCII 串并可选地断言。
 
     例如获取 Mac 地址 ``10 42 13 00 | 00 00 'FC:19:28:36:95:69'``。
@@ -171,7 +208,7 @@ def query_str(cmd: int, expect: Optional[str] = None,
     rx = re.compile(pattern) if pattern else None
 
     def run(ctx: "Ctx") -> None:
-        pkt = ctx.step(cmd)
+        pkt = ctx.step(cmd, tag=tag)
         raw = pkt.data[2:].split(b"\x00")[0]
 
         if not raw:
@@ -275,7 +312,8 @@ def set_and_restore(cmd: int, data: bytes, expect: int,
     return run
 
 
-def query_hex(cmd: int, min_len: int = 1, expect_len: Optional[int] = None):
+def query_hex(cmd: int, min_len: int = 1, expect_len: Optional[int] = None,
+              tag: int = Tag.TG):
     """查询指令，返回内容格式未知时直接打十六进制。
 
     用于结构还没搞清楚的查询（编码参数、AP 参数这类），
@@ -286,7 +324,7 @@ def query_hex(cmd: int, min_len: int = 1, expect_len: Optional[int] = None):
                        长度变了说明协议改了或者流错位了
     """
     def run(ctx: "Ctx") -> None:
-        pkt = ctx.step(cmd)
+        pkt = ctx.step(cmd, tag=tag)
         payload = pkt.data[2:]
 
         if len(payload) < min_len:
@@ -309,6 +347,9 @@ class Ctx:
     ssid: str = ""
     password: str = ""
     cycle: int = 0
+    # 被测设备的角色（uart_role.Setup）。测试函数要按角色分叉时读它。
+    # None = 没指定，测试一律照跑。
+    setup: Any = None
 
     # 测试之间传递的状态
     scan_count: int = 0
@@ -316,6 +357,7 @@ class Ctx:
 
     # 统计
     warns: int = 0
+    checksum_errors: int = 0
     on_warn: Optional[Callable[[], None]] = None    # 告警后刷新状态栏用
 
     # ---------------------------------------------------------------- 收发
@@ -327,18 +369,32 @@ class Ctx:
         got = self.client.recv(timeout, quiet)
         if got is None:
             return None
+
         pkt, raw = got
-        ui.log_hex("RX", raw)
+        ui.log_hex("RX", raw)        # 先打原始字节，损坏的包也要留证据
+
+        # 校验和不对说明线上有字节损坏。不校验的话会拿着错数据往下跑，
+        # 而且症状会伪装成"设备返回了奇怪的值"，非常难查。
+        if not pkt.checksum_ok:
+            self.checksum_errors += 1
+            ui.log(f"✗ 校验和错误: 字段 0x{pkt.checksum:04X} ≠ "
+                   f"重算 0x{checksum_of(raw):04X}（线路有字节损坏）")
+            return None
+
         return pkt
 
-    def recv_reply(self, want_id: int,
-                   timeout: Optional[float] = None) -> Optional[Packet]:
+    def recv_reply(self, want_id: int, timeout: Optional[float] = None,
+                   want_tag: bytes = TAG_LOCAL) -> Optional[Packet]:
         """读当前命令的应答，途中的异步通知记录下来并跳过。
 
         设备会主动推送不对应任何请求的通知（状态变化、OTA 版本），
-        当成应答收下会让整条流永久错位。跳过的判据两条：
+        当成应答收下会让整条流永久错位。跳过的判据三条：
+
         1. Command ID 不匹配 —— 明显是别的命令的通知
-        2. ID 相同但内容是状态变化通知 —— NET_STA_CTRL 的应答和状态通知
+        2. **TAG 不匹配** —— 应答带的 TAG 和请求一样，所以本地请求的应答
+           不能拿对端的应答来顶。1 对多时对端们的应答会和本地应答挤在
+           同一条串口上，只比 ID 就会认错
+        3. ID 相同但内容是状态变化通知 —— NET_STA_CTRL 的应答和状态通知
            共用 0x4223，只能靠内容区分
         """
         for _ in range(MAX_REPLY_PKTS):
@@ -346,16 +402,19 @@ class Ctx:
             if pkt is None:
                 return None
 
-            if pkt.cmd_id == want_id and not pkt.is_state_notify:
+            if (pkt.cmd_id == want_id and pkt.tag == want_tag
+                    and not pkt.is_state_notify):
                 return pkt
 
-            ui.log(f"  (跳过异步通知: cmd=0x{pkt.cmd_id:04X} len={len(pkt.data)})")
+            ui.log(f"  (跳过异步通知: {self._describe(pkt)})")
 
-        ui.log(f"✗ 连续 {MAX_REPLY_PKTS} 个包都不是期望的应答 0x{want_id:04X}")
+        ui.log(f"✗ 连续 {MAX_REPLY_PKTS} 个包都不是期望的应答 "
+               f"0x{want_id:04X}[{tag_name(tag_value(want_tag))}]")
         return None
 
     def wait_optional(self, want_id: int, accept: Callable[[Packet], bool],
-                      timeout: float) -> Optional[Packet]:
+                      timeout: float,
+                      want_tag: bytes = TAG_LOCAL) -> Optional[Packet]:
         """等一个可选的应答包。收不到返回 None，由调用方决定告警还是忽略。
 
         超时是正常结束条件，所以用 quiet 抑制底层的 ✗ 超时提示 ——
@@ -366,28 +425,47 @@ class Ctx:
             if pkt is None:
                 return None
 
-            if pkt.cmd_id == want_id and accept(pkt):
+            if pkt.cmd_id == want_id and pkt.tag == want_tag and accept(pkt):
                 return pkt
 
-            ui.log(f"  (跳过不匹配的包: cmd=0x{pkt.cmd_id:04X} "
-                   f"len={len(pkt.data)})")
+            ui.log(f"  (跳过不匹配的包: {self._describe(pkt)})")
         return None
 
+    @staticmethod
+    def _describe(pkt: Packet) -> str:
+        """跳过包时的一行描述。TAG 一定要打 —— 光看 ID 分不出是本地还是
+        对端的应答，而这两种混在一起正是最难查的错位来源。"""
+        return (f"cmd=0x{pkt.cmd_id:04X}[{pkt.tag_name}] "
+                f"len={len(pkt.data)}")
+
     # ---------------------------------------------------------------- 原语
-    def step(self, cmd: int, data: bytes = b"") -> Packet:
+    def step(self, cmd: int, data: bytes = b"",
+             tag: int = Tag.TG) -> Packet:
         """发命令 → 读匹配的应答 → 查返回码。失败抛 TestFailed。
 
         测试名由 runner 打日志，这里只管收发和判定。
-        """
-        self.send(build(cmd, data))
 
-        pkt = self.recv_reply(resp_id_of(cmd))
+        :param tag: 默认本地执行。传 ``Tag.PL`` / ``Tag.PP`` 就是 Remote
+            指令，应答按同一个 TAG 匹配。
+        """
+        pkt_out = build(cmd, data, tag=tag)
+        self.send(pkt_out)
+
+        pkt = self.recv_reply(resp_id_of(cmd), want_tag=pkt_out.tag)
         if pkt is None:
             raise TestFailed("没有收到应答")
         if not pkt.ok:
             raise TestFailed(f"rc={pkt.rc} {err_name(pkt.rc)}")
 
         return pkt
+
+    def remote_step(self, cmd: int, data: bytes = b"",
+                    to_mcu: bool = False) -> Packet:
+        """Remote 指令：本地 AM 透过 WiFi 送给对端执行。
+
+        :param to_mcu: False 对端 AM 执行；True 对端 AM 再下发给它的 MCU。
+        """
+        return self.step(cmd, data, tag=Tag.PP if to_mcu else Tag.PL)
 
     def warn(self, what: str) -> None:
         """打告警并停下来问。选中止就抛 Aborted。
@@ -530,3 +608,32 @@ def filter_tests(tests: list, tags: Optional[list]) -> list:
                         changed = True
 
     return [t for t in tests if t.name in keep]
+
+
+def filter_by_setup(tests: list, setup) -> tuple:
+    """按角色前提排除测试。返回 ``(保留的, [(名字, 原因), ...])``。
+
+    **排除而不是跳过**：一台 Tx 在一对一里不连路由，"扫描网络"对它
+    不适用 —— 这不是缺陷，不该出现在报告里。跳过会让人以为漏测了。
+
+    依赖会跟着断：如果"获取扫描结果"被排除，依赖它的"连接网络"也留不住。
+    所以排除之后要再收一遍，把依赖已经没了的一并去掉 —— 否则它们会
+    因为"依赖未通过"被判成跳过，看起来像是出了问题。
+    """
+    if setup is None:
+        return tests, []
+
+    excluded = [(t.name, t.why_excluded(setup))
+                for t in tests if not t.applies_to(setup)]
+    keep = {t.name for t in tests if t.applies_to(setup)}
+
+    changed = True
+    while changed:
+        changed = False
+        for t in tests:
+            if t.name in keep and any(n not in keep for n in t.needs):
+                keep.discard(t.name)
+                excluded.append((t.name, "依赖的测试已被角色排除"))
+                changed = True
+
+    return [t for t in tests if t.name in keep], excluded
