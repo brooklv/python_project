@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+test.log
+*.log
+*.ptp
+*.xlsx
